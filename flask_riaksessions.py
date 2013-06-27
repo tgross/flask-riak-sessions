@@ -23,6 +23,7 @@ import hmac
 import hashlib
 import json
 import logging
+import os
 
 import riak
 from werkzeug.datastructures import CallbackDict
@@ -217,11 +218,9 @@ class RiakSessions(object):
         Sets up default config variables and instantiates the session interface.
 
         """
-        app.config.setdefault('RIAK_BIN_DIR',
-                              '/Users/tgross/lib/riak-1.3.2/rel/riak/bin')
+        app.config.setdefault('RIAK_BIN_DIR', os.environ.get('RIAK_DIR',''))
         app.config.setdefault('RIAK_HTTP_PORT', 10018)
         app.config.setdefault('RIAK_PROTOBUFS_PORT', 9001)
         app.config.setdefault('RIAK_SESSIONS_HASH_FUNCTION', hashlib.sha256)
-        app.config.setdefault('RIAK_SESSIONS_SALT_LENGTH', 20)
 
         app.session_interface = RiakSessionInterface(app)
