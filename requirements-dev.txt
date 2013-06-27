@@ -1,0 +1,10 @@
+Flask==0.10.1
+Jinja2==2.7
+MarkupSafe==0.18
+Werkzeug==0.9.1
+itsdangerous==0.21
+protobuf==2.4.1
+pyflakes==0.7.2
+riak==1.5.2
+riak-pb==1.2.1
+wsgiref==0.1.2
