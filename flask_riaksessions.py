@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+from uuid import uuid4
 
 import riak
 from werkzeug.datastructures import CallbackDict
@@ -80,7 +81,7 @@ class RiakSession(CallbackDict, SessionMixin):
     Implements a Flask session that can be HMAC-signed.
     """
 
-    def __init__(self, initial=None, sid=None, new=False, expiry=None):
+    def __init__(self, initial=None, sid=None, token=None, new=False, expiry=None):
         def on_update(self):
             """
             Set the dirty-session flag.
@@ -89,10 +90,14 @@ class RiakSession(CallbackDict, SessionMixin):
 
         CallbackDict.__init__(self, initial, on_update)
         self.sid = sid
+        self.token = token
         self.new = new
         self.modified = False
         self.expiry = expiry
 
+    @property
+    def key(self):
+        return '{}!{}'.format(self.token, self.sid)
 
 
 class RiakSessionInterface(SessionInterface):
@@ -122,7 +127,7 @@ class RiakSessionInterface(SessionInterface):
 
         """
         session_bucket = self.client.bucket('sessions')
-        session_object = session_bucket.new(session.sid,
+        session_object = session_bucket.new(session.key,
                                             (session.expiry,
                                              json.dumps(dict(session),
                                                         cls=Encoder)))
@@ -136,19 +141,20 @@ class RiakSessionInterface(SessionInterface):
 
         """
         sid = self.generate_sid(app, ip, user_agent)
+        token, cookie_sid = cookie.split('!', 1)
 
-        if cookie != sid:
+        if cookie_sid != sid:
             raise SessionValidationError('Tampered session.')
 
         session_bucket = self.client.bucket('sessions')
-        stored_value = session_bucket.get(sid)
+        stored_value = session_bucket.get(cookie)
         if stored_value:
             expiry, serialized = stored_value.get_data()
             if serialized and (expiry is None or expiry > datetime.now()):
                 data = json.loads(serialized, object_hook=date_hook)
-                return RiakSession(data, sid=sid, expiry=expiry)
+                return RiakSession(data, sid=sid, token=token, expiry=expiry)
 
-        session = RiakSession(sid=sid)
+        session = RiakSession(sid=sid, token=uuid4(), new=True)
         session.expiry = self.get_expiration_time(app, session)
         return session
 
@@ -173,7 +179,7 @@ class RiakSessionInterface(SessionInterface):
                 LOG.exception('Invalid session')
 
         sid = self.generate_sid(app, ip, user_agent)
-        session = RiakSession(sid=sid, new=True)
+        session = RiakSession(sid=sid, token=uuid4(), new=True)
         session.expiry = self.get_expiration_time(app, session)
         return session
 
@@ -193,7 +199,7 @@ class RiakSessionInterface(SessionInterface):
             return
 
         self.put(session)
-        cookie_contents = session.sid
+        cookie_contents = session.key
         response.set_cookie(app.session_cookie_name, cookie_contents,
                             expires=session.expiry,
                             httponly=self.get_cookie_httponly(app),
