@@ -6,7 +6,7 @@ Assumes you have a Riak instance running.
 from datetime import datetime
 
 from flask import Flask, session, request
-from flask.ext.riaksessions import RiakSessions
+from flask_riaksessions import RiakSessions
 
 app = Flask(__name__)
 app.config.from_object(__name__)
