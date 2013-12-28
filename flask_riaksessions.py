@@ -17,201 +17,201 @@ __license__ = 'MIT'
 __copyright__ = '(c) 2013 Tim Gross'
 __all__ = ['RiakSessions', 'RiakSessionInterface', 'RiakSession']
 
-import base64
 from datetime import datetime
-import hmac
 import hashlib
-import json
 import logging
 import os
-from uuid import uuid4
+import string
+import time
 
-import riak
+from riak import RiakClient
 from werkzeug.datastructures import CallbackDict
-from flask.sessions import SessionInterface, SessionMixin
+from flask.sessions import SessionInterface, SessionMixin, TaggedJSONSerializer
 
-# shut up about short parameter names
-# pylint: disable=C0103
 LOG = logging.getLogger(__name__)
 
-def get_hmac(app, content):
-    """
-    Generates the hash message authentication code (HMAC) using the application
-    configuration and the passed content. The content should include a salt.
-    Takes the RIAK_SESSIONS_HASH_FUNCTION and SECRET_KEY app config.
-    """
-    hash_function = app.config['RIAK_SESSIONS_HASH_FUNCTION']
-    secret = app.config['SECRET_KEY']
-    return base64.b64encode(hmac.new(secret, content, hash_function).digest())
+# borrowed from Django; we use the system PRNG
+# if its present and otherwise fallback
+import random
+try:
+    random = random.SystemRandom()
+    USING_SYSRANDOM = True
+except NotImplementedError:
+    import warnings
+    warnings.warn('A secure pseudo-random number generator is not available '
+                  'on your system. Falling back to Mersenne Twister.')
+    USING_SYSRANDOM = False
 
-class Encoder(json.JSONEncoder):
-    """
-    Subclasses JSONEncoder to handle datetimes.
-    """
 
-    def default(self, obj):
-        """
-        Encodes datetime objects in annotated ISO-format:
-        '/Date(2013-06-25T23:57:32.779968)/'
-        """
-        if isinstance(obj, datetime):
-            return u'/Date({})/'.format(obj.isoformat())
-        return super(Encoder, self).default(self, obj)
+class InvalidSession(Exception):
+    """
+    Raised in the event a session ID can't be found in the
+    datastore and we want to mark it as a suspicious operation.
 
-def date_hook(data):
     """
-    Decodes strings that match the pattern created by the Endoder into datetime
-    objects.
-    """
-    for key, val in data.items():
-        if val.startswith('/Date('):
-            data[key] = datetime.strptime(val.lstrip('/Date(').rstrip(')/'),
-                                          "%Y-%m-%dT%H:%M:%S.%f")
-    return data
+    pass
 
-class SessionValidationError(Exception):
+class ExpiredSession(Exception):
     """
-    Raised in the event a session id cannot be validated and should ignored.
+    Raised in the event a session ID has expired and we want
+    to clear it.
+
     """
     pass
 
 
+
 class RiakSession(CallbackDict, SessionMixin):
     """
-    Implements a Flask session that can be HMAC-signed.
-    """
+    Implements a Flask session
 
-    def __init__(self, initial=None, sid=None, token=None, new=False, expiry=None):
+    """
+    def __init__(self, initial=None, token=None, expiry=None):
         def on_update(self):
-            """
-            Set the dirty-session flag.
-            """
+            """ Set the dirty-session flag. """
             self.modified = True
 
         CallbackDict.__init__(self, initial, on_update)
-        self.sid = sid
-        self.token = token
-        self.new = new
         self.modified = False
+        self.token = token
         self.expiry = expiry
 
-    @property
-    def key(self):
-        return '{}!{}'.format(self.token, self.sid)
 
 
 class RiakSessionInterface(SessionInterface):
     """
-    Implements a Flask session interface that uses Riak as the backing store
-    and HMAC-signs the session cookie.
-    """
+    Implements a Flask session interface that uses Riak as the backing store.
+    Watch out for the mutability of the session object if you extend this
+    class; the superclass relies on this. The serializer and session_class
+    have been made class attributes so that you can override the behavior
+    of e.g. the serializer.
 
-    def __init__(self, app, client=None):
+    """
+    serializer = TaggedJSONSerializer()
+    session_class = RiakSession
+
+    def __init__(self, client=None):
+        self.bucket = self.app.config['RIAK_SESSION_BUCKET']
         if client is None:
-            client = riak.RiakClient(port=app.config['RIAK_HTTP_PORT'])
+            config = self.app.config['RIAK_SESSION_CONN']
+            client = RiakClient(**config)
         self.client = client
 
-    def generate_sid(self, app, ip, user_agent):
+    def _generate_token(self):
         """
-        Uses the IP and user-agent as the inputs to an HMAC to be used as the
-        unique session ID.
+        Generate a random session token. Borrows Django's approach
+        of re-seeding the PRNG with a difficult-to-predict value
+        when a system PRNG isn't available.
 
         """
-        sid = get_hmac(app, '{}.{}'.format(ip, base64.b64encode(user_agent)))
-        return sid
+        valid_token_chars = string.ascii_lowercase + string.digits
+        if not USING_SYSRANDOM:
+            seed_input = ("%s%s%s" % (random.getstate(),
+                                      time.time(),
+                                      self.app.config['SECRET_KEY']))
+            random.seed(hashlib.sha256(seed_input.encode('utf-8')).digest())
+        return ''.join(random.choice(valid_token_chars) for i in range(32))
 
 
-    def put(self, session):
+    def _put(self, session):
         """
         Stores the session data and expiry time in the Riak datastore.
 
         """
-        session_bucket = self.client.bucket('sessions')
-        session_object = session_bucket.new(session.key,
+        if not session.token:
+            # be lazy about generating keys
+            session.token = self._generate_token()
+        if not session.expiry:
+            now = datetime.now()
+            session.expiry = now + self.app.permanent_session_lifetime
+        session_bucket = self.client.bucket(self.bucket)
+        session_object = session_bucket.new(session.token,
                                             (session.expiry,
-                                             json.dumps(dict(session),
-                                                        cls=Encoder)))
+                                             self.serializer.dumps(session)))
         session_object.store()
 
-    def get(self, cookie, app, ip, user_agent):
+    def _get(self, token):
         """
-        Gets the session data from the Riak datastore and compares the HMAC
-        signatures of the IP and User-Agent against the session ID to ensure
-        it has not been altered.
+        Gets the session data from the Riak datastore.
+        Deserializes it and returns a RiakSession object. Raises an
+        ExpiredSession or InvalidSession exception in the event
+        the session is bad.
 
         """
-        sid = self.generate_sid(app, ip, user_agent)
-        token, cookie_sid = cookie.split('!', 1)
+        session_bucket = self.client.bucket(self.bucket)
+        # look at whether this is a possible timing attack here w/ Riak?
+        stored_data = session_bucket.get(token)
+        if stored_data:
+            expiry, serialized = stored_data.get_data()
+            if serialized:
+                if expiry and (expiry <= datetime.now()):
+                    session_bucket.delete(token)
+                    raise ExpiredSession()
+                data = self.serializer.loads(serialized)
+                return RiakSession(data, token=token, expiry=expiry)
 
-        if cookie_sid != sid:
-            raise SessionValidationError('Tampered session.')
-
-        session_bucket = self.client.bucket('sessions')
-        stored_value = session_bucket.get(cookie)
-        if stored_value:
-            expiry, serialized = stored_value.get_data()
-            if serialized and (expiry is None or expiry > datetime.now()):
-                data = json.loads(serialized, object_hook=date_hook)
-                return RiakSession(data, sid=sid, token=token, expiry=expiry)
-
-        session = RiakSession(sid=sid, token=uuid4(), new=True)
-        session.expiry = self.get_expiration_time(app, session)
-        return session
+        raise InvalidSession()
 
 
     def open_session(self, app, request):
         """
-        Fetch the session from the Riak database after validating the session ID
-        or create a new session ID + session.
+        Fetch the session from the Riak database or create a new
+        session ID and session.
 
         """
-        cookie = request.cookies.get(app.session_cookie_name)
-        ip = request.remote_addr
-        # Flask test server has no User-Agent, so return safe value here
-        user_agent = request.headers.get('User-Agent', 'NULL')
-
-        if cookie:
+        self.app = app
+        token = request.cookies.get(app.session_cookie_name)
+        if token:
             try:
-                session = self.get(cookie, app, ip, user_agent)
+                session = self._get(token)
                 return session
-            except SessionValidationError:
-                # we'll just pass and generate a new session
-                LOG.exception('Invalid session')
-
-        sid = self.generate_sid(app, ip, user_agent)
-        session = RiakSession(sid=sid, token=uuid4(), new=True)
-        session.expiry = self.get_expiration_time(app, session)
-        return session
+            except (ExpiredSession, InvalidSession):
+                # don't want hostile tokens showing up in prod logs
+                LOG.debug('Invalid or expired session token: {}'.format(token))
+        return self.session_class()
 
 
     def save_session(self, app, session, response):
         """
-        This will be called by Flask during request teardown.  Saves the session
-        if it has been modified.
+        This will be called by Flask during request teardown.  Saves the
+        session if it has been modified.
 
         """
+        self.app = app
         domain = self.get_cookie_domain(app)
+        path = self.get_cookie_path(app)
+
+        # delete the session and bail-out
         if not session:
-            response.delete_cookie(app.session_cookie_name, domain)
+            if session.modified:
+                response.delete_cookie(app.session_cookie_name,
+                                       domain=domain, path=path)
             return
 
-        if not session.modified:
+        # controlled by SESSION_REFRESH_EACH_REQUEST config flag and
+        # flag on the session
+        if not self.should_set_cookie(app, session):
             return
 
-        self.put(session)
-        cookie_contents = session.key
-        response.set_cookie(app.session_cookie_name, cookie_contents,
-                            expires=session.expiry,
-                            httponly=self.get_cookie_httponly(app),
-                            secure=self.get_cookie_secure(app),
-                            domain=domain)
+        httponly = self.get_cookie_httponly(app)
+        secure = self.get_cookie_secure(app)
+        expires = self.get_expiration_time(app, session)
+
+        self._put(session)
+        cookie_val = session.token
+
+        response.set_cookie(app.session_cookie_name, cookie_val,
+                            httponly=httponly, secure=secure, expires=expires,
+                            domain=domain, path=path)
 
 
 class RiakSessions(object):
     """
     Sets up the Flask-RiakSessions extension during application startup.
-    Instantiate this class and pass the application to the `app` argument to
-    set it up.
+    Use in main application module as follows:
+
+    app = Flask(__name__)
+    RiakSessions(app)
 
     """
     def __init__(self, app=None):
@@ -221,12 +221,15 @@ class RiakSessions(object):
 
     def init_app(self, app):
         """
-        Sets up default config variables and instantiates the session interface.
+        Sets up default config variables and instantiates the session
+        interface. RIAK_SESSION_NODES takes any value that can be passed
+        as kwargs to a RiakClient. See:
+        http://basho.github.io/riak-python-client/client.html#client-connections
 
         """
-        app.config.setdefault('RIAK_BIN_DIR', os.environ.get('RIAK_DIR',''))
-        app.config.setdefault('RIAK_HTTP_PORT', 10018)
-        app.config.setdefault('RIAK_PROTOBUFS_PORT', 9001)
-        app.config.setdefault('RIAK_SESSIONS_HASH_FUNCTION', hashlib.sha256)
-
+        app.config.setdefault('RIAK_SESSION_CONN',
+                              {'nodes': [{'host':'127.0.0.1',
+                                          'http_port':8098}]})
+        app.config.setdefault('RIAK_SESSION_BUCKET', 'sessions')
+        app.config.setdefault('RIAK_BIN_DIR', os.environ.get('RIAK_DIR', ''))
         app.session_interface = RiakSessionInterface(app)
