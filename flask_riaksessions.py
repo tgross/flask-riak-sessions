@@ -90,10 +90,10 @@ class RiakSessionInterface(SessionInterface):
     serializer = TaggedJSONSerializer()
     session_class = RiakSession
 
-    def __init__(self, client=None):
-        self.bucket = self.app.config['RIAK_SESSION_BUCKET']
+    def __init__(self, app, client=None):
+        self.bucket = app.config['RIAK_SESSION_BUCKET']
         if client is None:
-            config = self.app.config['RIAK_SESSION_CONN']
+            config = app.config['RIAK_SESSION_CONN']
             client = RiakClient(**config)
         self.client = client
 
@@ -122,8 +122,8 @@ class RiakSessionInterface(SessionInterface):
             # be lazy about generating keys
             session.token = self._generate_token()
         if not session.expiry:
-            now = datetime.now()
-            session.expiry = now + self.app.permanent_session_lifetime
+            now = datetime.utcnow() + self.app.permanent_session_lifetime
+            session.expiry = time.mktime(now.timetuple())
         session_bucket = self.client.bucket(self.bucket)
         session_object = session_bucket.new(session.token,
                                             (session.expiry,
@@ -142,9 +142,9 @@ class RiakSessionInterface(SessionInterface):
         # look at whether this is a possible timing attack here w/ Riak?
         stored_data = session_bucket.get(token)
         if stored_data:
-            expiry, serialized = stored_data.get_data()
+            expiry, serialized = stored_data.get_encoded_data()
             if serialized:
-                if expiry and (expiry <= datetime.now()):
+                if expiry and (expiry <= time.mktime(datetime.utcnow().timetuple())):
                     session_bucket.delete(token)
                     raise ExpiredSession()
                 data = self.serializer.loads(serialized)
@@ -152,6 +152,16 @@ class RiakSessionInterface(SessionInterface):
 
         raise InvalidSession()
 
+    def should_set_cookie(self, app, session):
+        """
+        We should set the cookie if the app is configured to do
+        so every time or if the session is currently dirty.
+        """
+        if app.config.get('SESSION_REFRESH_EACH_REQUEST', False):
+            return True
+        if session.modified:
+            return True
+        return False
 
     def open_session(self, app, request):
         """
